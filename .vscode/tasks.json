@@ -1,0 +1,1 @@
+{"version":"2.0.0","tasks":[{"label":"Run .NET API","type":"shell","command":"dotnet run --project backend/LifePilot.Api/LifePilot.Api.csproj","isBackground":true,"problemMatcher":[]},{"label":"Run React frontend","type":"shell","command":"npm run dev --prefix frontend","isBackground":true,"problemMatcher":[]}]}

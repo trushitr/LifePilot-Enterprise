@@ -1,0 +1,24 @@
+name: Build and test
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - run: dotnet test backend/LifePilot.Tests/LifePilot.Tests.csproj
+        env:
+          LIFEPILOT_JWT_KEY: ${{ secrets.LIFEPILOT_JWT_KEY }}
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
