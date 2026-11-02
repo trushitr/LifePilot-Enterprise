@@ -31,14 +31,27 @@ builder.Services.AddAuthorization(options => {
     options.AddPolicy("MemberOrAdmin", policy => policy.RequireRole("Member", "Admin"));
 });
 builder.Services.AddHostedService<ReminderWorker>();
+// Recurring tasks: the scheduler is scoped (it owns a DbContext) and shared by the API endpoints and the background
+// worker; TimeProvider is injected so tests can drive the clock deterministically.
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddScoped<RecurringTaskScheduler>();
+builder.Services.AddHostedService<RecurringTaskWorker>();
 builder.Services.AddSingleton<TransientRetryService>();
 builder.Services.AddProblemDetails();
+// Malformed request bodies (unparseable JSON, wrong JSON shape, wrong content type) are surfaced by the minimal-API binder as
+// BadHttpRequestException, which ApiExceptionHandler turns into a Problem Details response. Without this the framework only
+// throws in Development and writes an empty 400 in Production, so clients would see different error bodies per environment.
+builder.Services.Configure<RouteHandlerOptions>(o => o.ThrowOnBadRequest = true);
 builder.Services.AddExceptionHandler<ApiExceptionHandler>();
 builder.Services.AddHealthChecks();
 builder.Services.AddRateLimiter(o => { o.RejectionStatusCode = 429; o.AddFixedWindowLimiter("auth", x => { x.PermitLimit = 10; x.Window = TimeSpan.FromMinutes(1); x.QueueLimit = 0; }); });
 var app = builder.Build();
 app.UseExceptionHandler(); app.UseCors("local"); app.UseRateLimiter(); app.UseAuthentication(); app.UseAuthorization();
-using (var scope = app.Services.CreateScope()) await scope.ServiceProvider.GetRequiredService<LifeDb>().Database.EnsureCreatedAsync();
+using (var scope = app.Services.CreateScope()) {
+    var db = scope.ServiceProvider.GetRequiredService<LifeDb>();
+    // Creates the schema, tolerates another instance creating it at the same moment, and adds tables a newer version needs.
+    await SchemaBootstrap.InitializeAsync(db, app.Logger);
+}
 app.MapHealthChecks("/api/health");
 app.MapPost("/api/auth/register", async (Credentials input, LifeDb db, CancellationToken ct) => {
     var email = input.Email.Trim().ToLowerInvariant();
@@ -57,8 +70,11 @@ app.MapPost("/api/auth/login", async (Credentials input, LifeDb db, Cancellation
 var secure = app.MapGroup("/api").RequireAuthorization("MemberOrAdmin");
 secure.MapGet("/admin/stats", async (LifeDb db, CancellationToken ct) => Results.Ok(new {
     users = await db.Users.CountAsync(ct), items = await db.Items.CountAsync(ct),
-    pendingReminders = await db.Reminders.CountAsync(x => !x.Delivered, ct)
+    pendingReminders = await db.Reminders.CountAsync(x => !x.Delivered, ct),
+    activeRecurringTasks = await db.RecurringTasks.CountAsync(x => x.IsActive, ct),
+    openOccurrences = await db.TaskOccurrences.CountAsync(x => !x.Completed, ct)
 })).RequireAuthorization("AdminOnly");
+secure.MapRecurringTasks();
 secure.MapGet("/reminders", async (LifeDb db, ClaimsPrincipal user, CancellationToken ct) => {
     var owner = UserId(user);
     return await db.Reminders.Where(x => x.UserId == owner).OrderBy(x => x.DueUtc).ToListAsync(ct);
@@ -135,10 +151,34 @@ secure.MapGet("/backup", async (LifeDb db, ClaimsPrincipal user, CancellationTok
     var owner = UserId(user);
     return await db.Items.Where(x => x.UserId == owner).OrderBy(x => x.Id).Select(x => new NewItem(x.Kind,x.Title,x.Category,x.Amount,x.Date)).ToListAsync(ct);
 });
-secure.MapPost("/restore", async (LifeDb db, ClaimsPrincipal user, List<NewItem> items, CancellationToken ct) => {
-    if (items.Count > 5000) throw new ValidationException("Backup is too large."); foreach(var i in items) Validate(i);
-    db.Items.AddRange(items.Select(x => new LifeItem { UserId = UserId(user), Kind=x.Kind, Title=x.Title.Trim(), Category=x.Category?.Trim() ?? "", Amount=x.Amount ?? 0, Date=x.Date, CreatedUtc=DateTime.UtcNow }));
-    await db.SaveChangesAsync(ct); return Results.Ok(new { imported = items.Count });
+secure.MapPost("/restore", async (LifeDb db, ClaimsPrincipal user, List<NewItem?>? items, CancellationToken ct) => {
+    // Validate the whole backup first so a single bad entry rejects the import before anything is written.
+    var incoming = ValidateBackup(items);
+    var owner = UserId(user);
+    // An empty backup is valid but has nothing to compare or write; skip the transaction and the item scan.
+    if (incoming.Count == 0) return Results.Ok(new { imported = 0, skipped = 0, total = 0 });
+    // Backups carry no database IDs, so an existing record is recognised by its ItemKey (kind, title, category, amount, date).
+    // The duplicate check and the inserts share one transaction so the import is all-or-nothing. Serializable maps to
+    // BEGIN IMMEDIATE in Microsoft.Data.Sqlite, which takes the writer lock *before* the read below; a second restore
+    // (or POST /items) therefore waits at this line and then sees the first one's rows, instead of both reading an empty
+    // set and both inserting. Do not downgrade this to a deferred transaction.
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
+    var existing = await db.Items.Where(x => x.UserId == owner)
+        .Select(x => new { x.Kind, x.Title, x.Category, x.Amount, x.Date }).ToListAsync(ct);
+    // Each stored record can satisfy one incoming record, so a backup holding two identical rows still restores both
+    // into an account that has only one, while re-importing the same backup imports nothing.
+    var unmatched = new Dictionary<ItemKey, int>();
+    foreach (var e in existing) { var k = ItemKey.Create(e.Kind, e.Title, e.Category, e.Amount, e.Date); unmatched[k] = unmatched.GetValueOrDefault(k) + 1; }
+    var imported = 0; var skipped = 0; var now = DateTime.UtcNow;
+    foreach (var x in incoming) {
+        var k = ItemKey.From(x);
+        if (unmatched.TryGetValue(k, out var remaining) && remaining > 0) { unmatched[k] = remaining - 1; skipped++; continue; }
+        db.Items.Add(new LifeItem { UserId = owner, Kind = k.Kind, Title = k.Title, Category = k.Category, Amount = k.Amount, Date = k.Date, CreatedUtc = now });
+        imported++;
+    }
+    if (imported > 0) await db.SaveChangesAsync(ct);
+    await tx.CommitAsync(ct);
+    return Results.Ok(new { imported, skipped, total = incoming.Count });
 });
 secure.MapPost("/assistant", (Command input) => {
     if (input.Text is null || input.Text.Length > 500) throw new ValidationException("Command must be at most 500 characters.");
@@ -151,24 +191,77 @@ secure.MapPost("/assistant", (Command input) => {
 });
 app.Run();
 static int UserId(ClaimsPrincipal principal) => int.Parse(principal.FindFirstValue(ClaimTypes.NameIdentifier) ?? throw new UnauthorizedAccessException());
+static bool IsInvalidItem(NewItem x) =>
+    x.Kind is not ("task" or "grocery" or "event") || string.IsNullOrWhiteSpace(x.Title) || x.Title.Length > 200 || x.Amount is < 0 or > 100000000 || (x.Date is not null && !DateOnly.TryParse(x.Date, out _));
 static void Validate(NewItem x) {
-    if (x.Kind is not ("task" or "grocery" or "event") || string.IsNullOrWhiteSpace(x.Title) || x.Title.Length > 200 || x.Amount is < 0 or > 100000000 || (x.Date is not null && !DateOnly.TryParse(x.Date, out _))) throw new ValidationException("Invalid item kind, title, amount, or date.");
+    if (IsInvalidItem(x)) throw new ValidationException("Invalid item kind, title, amount, or date.");
+}
+// Checks an entire backup payload and returns it as a non-null list. Throws on the first problem, naming the offending index,
+// so the caller can reject the whole import before touching the database.
+static List<NewItem> ValidateBackup(List<NewItem?>? items) {
+    if (items is null) throw new ValidationException("Backup must be a JSON array of items.");
+    if (items.Count > BackupLimits.MaxItems) throw new ValidationException($"Backup is too large (maximum {BackupLimits.MaxItems} items).");
+    var result = new List<NewItem>(items.Count);
+    for (var i = 0; i < items.Count; i++) {
+        var item = items[i];
+        if (item is null) throw new ValidationException($"Backup item at index {i} is missing.");
+        if (IsInvalidItem(item)) throw new ValidationException($"Backup item at index {i} has an invalid kind, title, amount, or date.");
+        result.Add(item);
+    }
+    return result;
 }
 public class LifeDb(DbContextOptions<LifeDb> options) : DbContext(options) {
     public DbSet<Reminder> Reminders => Set<Reminder>(); public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>(); public DbSet<LifeItem> Items => Set<LifeItem>(); public DbSet<AppUser> Users => Set<AppUser>(); public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
-    protected override void OnModelCreating(ModelBuilder m) { m.Entity<AppUser>().HasIndex(x=>x.Email).IsUnique(); m.Entity<IdempotencyRecord>().HasIndex(x=>new{x.UserId,x.Key}).IsUnique(); m.Entity<LifeItem>().HasIndex(x=>x.UserId); m.Entity<Reminder>().HasIndex(x=>new{x.Delivered,x.DueUtc}); m.Entity<AuditEvent>().HasIndex(x=>new{x.UserId,x.OccurredUtc}); }
+    public DbSet<RecurringTask> RecurringTasks => Set<RecurringTask>(); public DbSet<TaskOccurrence> TaskOccurrences => Set<TaskOccurrence>(); public DbSet<TaskReminder> TaskReminders => Set<TaskReminder>(); public DbSet<TaskReminderOccurrence> TaskReminderOccurrences => Set<TaskReminderOccurrence>();
+    protected override void OnModelCreating(ModelBuilder m) {
+        m.Entity<AppUser>().HasIndex(x=>x.Email).IsUnique(); m.Entity<IdempotencyRecord>().HasIndex(x=>new{x.UserId,x.Key}).IsUnique(); m.Entity<LifeItem>().HasIndex(x=>x.UserId); m.Entity<Reminder>().HasIndex(x=>new{x.Delivered,x.DueUtc}); m.Entity<AuditEvent>().HasIndex(x=>new{x.UserId,x.OccurredUtc});
+        // Recurring tasks. The unique indexes are the last line of defence against duplicate occurrences and reminders.
+        m.Entity<RecurringTask>().HasIndex(x => new { x.UserId, x.IsActive });
+        m.Entity<TaskOccurrence>().HasOne(x => x.RecurringTask).WithMany().HasForeignKey(x => x.RecurringTaskId).OnDelete(DeleteBehavior.Cascade);
+        m.Entity<TaskOccurrence>().HasIndex(x => new { x.RecurringTaskId, x.SequenceNumber }).IsUnique();
+        m.Entity<TaskOccurrence>().HasIndex(x => new { x.UserId, x.Completed, x.DueUtc });
+        m.Entity<TaskOccurrence>().HasIndex(x => new { x.Completed, x.ReminderSentUtc, x.ReminderAtUtc });
+        m.Entity<TaskReminder>().HasOne<TaskOccurrence>().WithMany().HasForeignKey(x => x.OccurrenceId).OnDelete(DeleteBehavior.Cascade);
+        m.Entity<TaskReminder>().HasIndex(x => x.OccurrenceId).IsUnique();
+        m.Entity<TaskReminder>().HasIndex(x => new { x.UserId, x.ReadUtc, x.CreatedUtc });
+        m.Entity<TaskReminderOccurrence>().HasOne<TaskReminder>().WithMany().HasForeignKey(x => x.ReminderId).OnDelete(DeleteBehavior.Cascade);
+        m.Entity<TaskReminderOccurrence>().HasOne<TaskOccurrence>().WithMany().HasForeignKey(x => x.OccurrenceId).OnDelete(DeleteBehavior.Cascade);
+        m.Entity<TaskReminderOccurrence>().HasIndex(x => new { x.ReminderId, x.OccurrenceId }).IsUnique();
+        m.Entity<TaskReminderOccurrence>().HasIndex(x => x.OccurrenceId);
+    }
 }
 public class AppUser { public int Id {get;set;} public string Email {get;set;}=""; public string PasswordHash {get;set;}=""; public string Role {get;set;}="Member"; }
 public class IdempotencyRecord { public int Id {get;set;} public int UserId {get;set;} public string Key {get;set;}=""; public string Fingerprint {get;set;}=""; public int ItemId {get;set;} }
 public class LifeItem { public int Id {get;set;} public int UserId {get;set;} public string Kind {get;set;}=""; public string Title {get;set;}=""; public string Category {get;set;}=""; public decimal Amount {get;set;} public string? Date {get;set;} public bool Done {get;set;} public DateTime CreatedUtc {get;set;} }
 public record Credentials(string Email,string Password);
 public record NewItem(string Kind,string Title,string? Category,decimal? Amount,string? Date);
+/// <summary>
+/// Identity of an item in a backup. Backups carry no database IDs, so two records are the same when every exported field
+/// matches after the same normalisation POST /api/items applies before storing (trimmed title, trimmed category with null
+/// treated as empty, null amount treated as zero). Record-struct value equality makes this usable as a dictionary key.
+/// </summary>
+public readonly record struct ItemKey(string Kind, string Title, string Category, decimal Amount, string? Date) {
+    // Single normalisation point used for both incoming backup rows and stored rows, so the comparison does not depend on
+    // stored data having been written through the API (the README documents hand-editing the SQLite file).
+    public static ItemKey Create(string kind, string title, string? category, decimal? amount, string? date) =>
+        new(kind, title.Trim(), category?.Trim() ?? "", amount ?? 0, date);
+    public static ItemKey From(NewItem x) => Create(x.Kind, x.Title, x.Category, x.Amount, x.Date);
+}
+public static class BackupLimits { public const int MaxItems = 5000; }
 public record UpdateItem(string? Title,string? Category,decimal? Amount,string? Date,bool? Done);
 public record Command(string Text);
 public sealed class ValidationException(string message) : Exception(message);
 public class ApiExceptionHandler(ILogger<ApiExceptionHandler> logger) : IExceptionHandler {
     public async ValueTask<bool> TryHandleAsync(HttpContext ctx, Exception error, CancellationToken ct) {
-        var status = error is ValidationException ? 400 : error is UnauthorizedAccessException ? 401 : 500;
+        // BadHttpRequestException is raised by the framework for malformed request bodies (e.g. JSON that is not the expected
+        // shape, or a non-JSON content type) because RouteHandlerOptions.ThrowOnBadRequest is enabled at startup; keep its own
+        // 4xx status (400/415/413) instead of reporting a server error.
+        var status = error switch {
+            ValidationException => 400,
+            UnauthorizedAccessException => 401,
+            BadHttpRequestException bad => bad.StatusCode,
+            _ => 500
+        };
         if (status == 500) logger.LogError(error, "Unhandled API error");
         ctx.Response.StatusCode = status;
         await ctx.Response.WriteAsJsonAsync(new ProblemDetails { Status=status, Title=status==500?"Unexpected server error":error.Message, Type=$"https://httpstatuses.com/{status}" }, ct);
