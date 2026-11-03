@@ -338,6 +338,7 @@ public static class RecurringTaskEndpoints
             await db.SaveChangesAsync(ct);
             var created = await scheduler.MaterializeAsync(task, now, ct);
             db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "recurring.created", EntityId = task.Id, OccurredUtc = now });
+            TaskActivityLog.RecurringCreated(db, task, owner, now);
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             return Results.Created($"/api/recurring-tasks/{task.Id}", RecurringTaskScheduler.ToDto(task, now, pending: created, completed: 0));
@@ -372,6 +373,7 @@ public static class RecurringTaskEndpoints
                 db.TaskReminders.RemoveRange(reminders);
                 db.TaskOccurrences.RemoveRange(pending);
                 db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "recurring.disabled", EntityId = task.Id, OccurredUtc = now });
+                TaskActivityLog.RecurringActiveChanged(db, task, wasActive: true, owner, now); // history: edited, active true → false
                 await db.SaveChangesAsync(ct);
             }
             await tx.CommitAsync(ct);
@@ -401,6 +403,7 @@ public static class RecurringTaskEndpoints
                 task.DisabledUtc = null;
                 await scheduler.MaterializeAsync(task, now, ct);
                 db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "recurring.enabled", EntityId = task.Id, OccurredUtc = now });
+                TaskActivityLog.RecurringActiveChanged(db, task, wasActive: false, owner, now); // history: edited, active false → true
                 await db.SaveChangesAsync(ct);
             }
             await tx.CommitAsync(ct);
@@ -417,7 +420,9 @@ public static class RecurringTaskEndpoints
             await db.TaskReminders.Where(r => r.RecurringTaskId == task.Id).ExecuteDeleteAsync(ct);
             await db.TaskOccurrences.Where(o => o.RecurringTaskId == task.Id).ExecuteDeleteAsync(ct);
             db.RecurringTasks.Remove(task);
-            db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "recurring.deleted", EntityId = task.Id, OccurredUtc = scheduler.UtcNow });
+            var now = scheduler.UtcNow;
+            db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "recurring.deleted", EntityId = task.Id, OccurredUtc = now });
+            TaskActivityLog.RecurringDeleted(db, task, owner, now); // the occurrences go with the schedule; one history row
             await db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
             return Results.NoContent();
@@ -449,6 +454,7 @@ public static class RecurringTaskEndpoints
                 occurrence.Completed = input.Completed.Value;
                 occurrence.CompletedUtc = input.Completed.Value ? now : null;
                 db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = input.Completed.Value ? "occurrence.completed" : "occurrence.reopened", EntityId = occurrence.Id, OccurredUtc = now });
+                TaskActivityLog.OccurrenceCompletionChanged(db, occurrence, occurrence.RecurringTask!, owner, now);
                 await db.SaveChangesAsync(ct);
                 // Reminders covering this occurrence are updated from the saved state: an ordinary reminder is settled, a
                 // catch-up summary only once every missed occurrence it reports is completed (its text shows the rest).

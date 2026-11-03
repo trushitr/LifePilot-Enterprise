@@ -16,6 +16,7 @@ ASP.NET Core 8 Minimal API
   |-- Polly transient-retry demonstration
   |-- Background reminder worker
   |-- Recurring task scheduler and worker (occurrences, in-app reminders)
+  |-- Task activity history (who changed which task, when, old/new values)
   |
   v
 Entity Framework Core
@@ -30,7 +31,7 @@ This is a single-machine prototype; it is not a distributed or multi-tenant prod
 
 **API and security:** ASP.NET Core Minimal APIs use JWT bearer tokens. New accounts receive `Member`; `/api/admin/stats` requires `Admin`. Protected endpoints derive user identity from the validated token and restrict item access to the authenticated user. Passwords are stored as salted PBKDF2 hashes. Authentication endpoints use rate limiting.
 
-**Persistence:** EF Core stores users, items, reminders, recurring tasks, task occurrences, task reminders, idempotency records, and audit events in SQLite. The application initializes the schema with `EnsureCreated()`, not EF Core migrations, wrapped by `SchemaBootstrap.InitializeAsync`: a concurrent creator winning the race is tolerated, the model's create script is re-executed as `CREATE ... IF NOT EXISTS` on every start (adds new tables and indexes, cannot alter existing columns), and the presence of every expected table is verified before the API starts serving.
+**Persistence:** EF Core stores users, items, reminders, recurring tasks, task occurrences, task reminders, task activity history, idempotency records, and audit events in SQLite. The application initializes the schema with `EnsureCreated()`, not EF Core migrations, wrapped by `SchemaBootstrap.InitializeAsync`: a concurrent creator winning the race is tolerated, the model's create script is re-executed as `CREATE ... IF NOT EXISTS` on every start (adds new tables and indexes, cannot alter existing columns), and the presence of every expected table is verified before the API starts serving.
 
 **Idempotency:** `POST /api/items` requires `Idempotency-Key`. The API computes a payload fingerprint and stores the created item and idempotency record in a transaction. A repeated matching request returns the existing item; key reuse with a different payload returns HTTP 409. Concurrent-request safety and record retention require additional work.
 
@@ -44,9 +45,11 @@ This is a single-machine prototype; it is not a distributed or multi-tenant prod
 
 **Recurring tasks:** `Recurrence.cs` holds the pure rule engine (`RecurrenceRule.DateAt(sequence)` derives every date from the anchor, so monthly schedules keep their intended day of month and nothing drifts; `Recurrence.ToUtc` converts local wall-clock times per time zone and handles DST gaps). `RecurringTaskModels.cs` holds the entities (`RecurringTask` schedule, `TaskOccurrence`, `TaskReminder`), request/response contracts and validation; it depends only on the BCL so it is unit-testable without a database. `RecurringTasks.cs` holds the `RecurringTaskScheduler` (reminders record the occurrences they cover in `TaskReminderOccurrences`, so a catch-up summary is settled only when all of them are completed) (scoped; per active schedule materializes every occurrence whose due or reminder time has passed plus at least one future occurrence, then raises in-app reminders for open occurrences whose reminder time has passed — one per upcoming occurrence, but a single catch-up reminder for the occurrences of a schedule that were missed while the API was stopped; the latest stored occurrence, not a counter, decides where to continue), the `RecurringTaskWorker` (a pass at startup for catch-up, then every 15 seconds), the minimal-API endpoints and the additive schema bootstrap. Time is read through `TimeProvider` so tests can control it. Concurrency: every pass and every API mutation of a schedule runs in a serializable (`BEGIN IMMEDIATE`) transaction, and unique indexes on `(RecurringTaskId, SequenceNumber)` and `(OccurrenceId)` make duplicate occurrences or reminders impossible even if two writers overlap. Reminders are database rows surfaced in the UI; there is no external delivery.
 
+**Task activity history:** `TaskActivity.cs` holds the append-only `TaskActivity` entity (owner, actor, task type and id, title snapshot, optional detail, action, JSON change list, UTC time), the pure helpers (`ItemSnapshot` + `TaskActivityChanges.Diff` compute field-level old/new values for an item update; the JSON change list is stored in the same camelCase shape the API returns), the `TaskActivityLog` recorder the item, recurring-task and occurrence endpoints call inside their existing transaction / `SaveChanges`, and `GET /api/task-activity` (per-owner, newest first, filters by type/task/action, cursor paging, actor e-mail joined at read time). History rows reference tasks by id without a foreign key so they outlive deletion. Only user actions are recorded; the scheduler's own work is not. `PUT`/`DELETE /api/items/{id}` now run in a serializable (`BEGIN IMMEDIATE`) transaction, like `POST /api/items` and the recurring-task endpoints, so overlapping duplicates of one request cannot each record the same change (the second reads the already-updated row and is a no-op) and a second delete is a 404 rather than a concurrency error. The item endpoints read the clock through `TimeProvider` so tests can assert timestamps. `AuditEvents` remains as the minimal security log.
+
 **Assistant:** The assistant endpoint uses predefined/rule-based command matching, not a hosted language model.
 
-**Frontend:** React/TypeScript communicates with the API via the Vite development proxy. Not every backend feature has a corresponding UI.
+**Frontend:** React/TypeScript communicates with the API via the Vite development proxy. `history.tsx` renders the History tab (filters, per-task view, paging); item rows offer inline editing (only changed fields are sent) and a shortcut to their history. Not every backend feature has a corresponding UI.
 
 ## Verification
 

@@ -75,6 +75,7 @@ secure.MapGet("/admin/stats", async (LifeDb db, CancellationToken ct) => Results
     openOccurrences = await db.TaskOccurrences.CountAsync(x => !x.Completed, ct)
 })).RequireAuthorization("AdminOnly");
 secure.MapRecurringTasks();
+secure.MapTaskActivity();
 secure.MapGet("/reminders", async (LifeDb db, ClaimsPrincipal user, CancellationToken ct) => {
     var owner = UserId(user);
     return await db.Reminders.Where(x => x.UserId == owner).OrderBy(x => x.DueUtc).ToListAsync(ct);
@@ -111,9 +112,9 @@ secure.MapGet("/items", async (LifeDb db, ClaimsPrincipal user, string? kind, Ca
     var owner = UserId(user);
     return await db.Items.Where(x => x.UserId == owner && (kind == null || x.Kind == kind)).OrderByDescending(x => x.Id).ToListAsync(ct);
 });
-secure.MapPost("/items", async (HttpContext ctx, LifeDb db, ClaimsPrincipal user, NewItem input, CancellationToken ct) => {
+secure.MapPost("/items", async (HttpContext ctx, LifeDb db, ClaimsPrincipal user, NewItem input, TimeProvider clock, CancellationToken ct) => {
     Validate(input);
-    var owner = UserId(user); var idempotencyKey = ctx.Request.Headers["Idempotency-Key"].ToString();
+    var owner = UserId(user); var idempotencyKey = ctx.Request.Headers["Idempotency-Key"].ToString(); var now = clock.GetUtcNow().UtcDateTime;
     if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > 100) return Results.BadRequest(new { message = "Idempotency-Key header required (1–100 characters)." });
     var fingerprint = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(JsonSerializer.Serialize(input))));
     // SQLite serializes writers; BEGIN IMMEDIATE is obtained by EF Core's serializable transaction.
@@ -124,34 +125,48 @@ secure.MapPost("/items", async (HttpContext ctx, LifeDb db, ClaimsPrincipal user
         var saved = await db.Items.SingleAsync(x => x.Id == previous.ItemId && x.UserId == owner, ct);
         return Results.Ok(saved);
     }
-    var item = new LifeItem { UserId = owner, Kind = input.Kind, Title = input.Title.Trim(), Category = input.Category?.Trim() ?? "", Amount = input.Amount ?? 0, Date = input.Date, CreatedUtc = DateTime.UtcNow };
+    var item = new LifeItem { UserId = owner, Kind = input.Kind, Title = input.Title.Trim(), Category = input.Category?.Trim() ?? "", Amount = input.Amount ?? 0, Date = input.Date, CreatedUtc = now };
     db.Items.Add(item); await db.SaveChangesAsync(ct);
-    db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "item.created", EntityId = item.Id, OccurredUtc = DateTime.UtcNow });
+    db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "item.created", EntityId = item.Id, OccurredUtc = now });
+    // History is written in the same transaction as the item; an idempotent replay (above) records nothing new.
+    TaskActivityLog.ItemCreated(db, item, owner, now);
     db.IdempotencyRecords.Add(new IdempotencyRecord { UserId = owner, Key = idempotencyKey, Fingerprint = fingerprint, ItemId = item.Id });
     await db.SaveChangesAsync(ct); await tx.CommitAsync(ct);
     return Results.Created($"/api/items/{item.Id}", item);
 });
-secure.MapPut("/items/{id:int}", async (int id, UpdateItem input, LifeDb db, ClaimsPrincipal user, CancellationToken ct) => {
-    var owner = UserId(user);
+secure.MapPut("/items/{id:int}", async (int id, UpdateItem input, LifeDb db, ClaimsPrincipal user, TimeProvider clock, CancellationToken ct) => {
+    var owner = UserId(user); var now = clock.GetUtcNow().UtcDateTime;
+    // Serializable (BEGIN IMMEDIATE) so the read below and the write are one unit: two overlapping copies of the same
+    // request (a retry, a double-click) are applied one after the other, and the second one sees the first one's result
+    // and records nothing, instead of both reading the old state and both writing a history row for the same change.
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
     var item = await db.Items.SingleOrDefaultAsync(x => x.Id == id && x.UserId == owner, ct); if (item is null) return Results.NotFound();
+    var before = ItemSnapshot.Of(item); // captured so the history can list old and new values of every changed field
     if (input.Title is not null) { if (string.IsNullOrWhiteSpace(input.Title) || input.Title.Length > 200) throw new ValidationException("Title must be 1–200 characters."); item.Title = input.Title.Trim(); }
     if (input.Category is not null) item.Category = input.Category.Trim();
     if (input.Amount is not null) { if (input.Amount < 0 || input.Amount > 100000000) throw new ValidationException("Invalid amount."); item.Amount = input.Amount.Value; }
     if (input.Date is not null) { if (input.Date != "" && !DateOnly.TryParse(input.Date, out _)) throw new ValidationException("Invalid date."); item.Date = input.Date == "" ? null : input.Date; }
     if (input.Done.HasValue) item.Done = input.Done.Value;
-    db.AuditEvents.Add(new AuditEvent { UserId = UserId(user), Action = "item.updated", EntityId = item.Id, OccurredUtc = DateTime.UtcNow });
-    await db.SaveChangesAsync(ct); return Results.Ok(item);
+    db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "item.updated", EntityId = item.Id, OccurredUtc = now });
+    // "edited" for changed fields and/or "completed" / "reopened" for the done flag; saved atomically with the item.
+    TaskActivityLog.ItemUpdated(db, before, item, owner, now);
+    await db.SaveChangesAsync(ct); await tx.CommitAsync(ct); return Results.Ok(item);
 });
-secure.MapDelete("/items/{id:int}", async (int id, LifeDb db, ClaimsPrincipal user, CancellationToken ct) => {
-    var owner = UserId(user);
+secure.MapDelete("/items/{id:int}", async (int id, LifeDb db, ClaimsPrincipal user, TimeProvider clock, CancellationToken ct) => {
+    var owner = UserId(user); var now = clock.GetUtcNow().UtcDateTime;
+    // Serializable for the same reason as PUT: a second, overlapping delete of the same item waits, then finds nothing
+    // and answers 404, rather than failing with a concurrency error after the first delete removed the row.
+    await using var tx = await db.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable, ct);
     var item = await db.Items.SingleOrDefaultAsync(x => x.Id == id && x.UserId == owner, ct); if (item is null) return Results.NotFound();
-    db.Items.Remove(item); db.AuditEvents.Add(new AuditEvent { UserId = UserId(user), Action = "item.deleted", EntityId = item.Id, OccurredUtc = DateTime.UtcNow }); await db.SaveChangesAsync(ct); return Results.NoContent();
+    db.Items.Remove(item); db.AuditEvents.Add(new AuditEvent { UserId = owner, Action = "item.deleted", EntityId = item.Id, OccurredUtc = now });
+    TaskActivityLog.ItemDeleted(db, item, owner, now); // keeps the title, so the history stays readable after deletion
+    await db.SaveChangesAsync(ct); await tx.CommitAsync(ct); return Results.NoContent();
 });
 secure.MapGet("/backup", async (LifeDb db, ClaimsPrincipal user, CancellationToken ct) => {
     var owner = UserId(user);
     return await db.Items.Where(x => x.UserId == owner).OrderBy(x => x.Id).Select(x => new NewItem(x.Kind,x.Title,x.Category,x.Amount,x.Date)).ToListAsync(ct);
 });
-secure.MapPost("/restore", async (LifeDb db, ClaimsPrincipal user, List<NewItem?>? items, CancellationToken ct) => {
+secure.MapPost("/restore", async (LifeDb db, ClaimsPrincipal user, List<NewItem?>? items, TimeProvider clock, CancellationToken ct) => {
     // Validate the whole backup first so a single bad entry rejects the import before anything is written.
     var incoming = ValidateBackup(items);
     var owner = UserId(user);
@@ -169,14 +184,22 @@ secure.MapPost("/restore", async (LifeDb db, ClaimsPrincipal user, List<NewItem?
     // into an account that has only one, while re-importing the same backup imports nothing.
     var unmatched = new Dictionary<ItemKey, int>();
     foreach (var e in existing) { var k = ItemKey.Create(e.Kind, e.Title, e.Category, e.Amount, e.Date); unmatched[k] = unmatched.GetValueOrDefault(k) + 1; }
-    var imported = 0; var skipped = 0; var now = DateTime.UtcNow;
+    var imported = 0; var skipped = 0; var now = clock.GetUtcNow().UtcDateTime;
+    var restored = new List<LifeItem>();
     foreach (var x in incoming) {
         var k = ItemKey.From(x);
         if (unmatched.TryGetValue(k, out var remaining) && remaining > 0) { unmatched[k] = remaining - 1; skipped++; continue; }
-        db.Items.Add(new LifeItem { UserId = owner, Kind = k.Kind, Title = k.Title, Category = k.Category, Amount = k.Amount, Date = k.Date, CreatedUtc = now });
+        var item = new LifeItem { UserId = owner, Kind = k.Kind, Title = k.Title, Category = k.Category, Amount = k.Amount, Date = k.Date, CreatedUtc = now };
+        db.Items.Add(item); restored.Add(item);
         imported++;
     }
-    if (imported > 0) await db.SaveChangesAsync(ct);
+    if (imported > 0) {
+        await db.SaveChangesAsync(ct); // assigns item ids
+        // Imported items enter the history as "created" (marked as restored) so their later edits have a starting point;
+        // skipped duplicates are not a change and leave no trace. Same transaction as the items themselves.
+        foreach (var item in restored) TaskActivityLog.ItemCreated(db, item, owner, now, detail: "Restored from backup");
+        await db.SaveChangesAsync(ct);
+    }
     await tx.CommitAsync(ct);
     return Results.Ok(new { imported, skipped, total = incoming.Count });
 });
@@ -213,6 +236,7 @@ static List<NewItem> ValidateBackup(List<NewItem?>? items) {
 public class LifeDb(DbContextOptions<LifeDb> options) : DbContext(options) {
     public DbSet<Reminder> Reminders => Set<Reminder>(); public DbSet<AuditEvent> AuditEvents => Set<AuditEvent>(); public DbSet<LifeItem> Items => Set<LifeItem>(); public DbSet<AppUser> Users => Set<AppUser>(); public DbSet<IdempotencyRecord> IdempotencyRecords => Set<IdempotencyRecord>();
     public DbSet<RecurringTask> RecurringTasks => Set<RecurringTask>(); public DbSet<TaskOccurrence> TaskOccurrences => Set<TaskOccurrence>(); public DbSet<TaskReminder> TaskReminders => Set<TaskReminder>(); public DbSet<TaskReminderOccurrence> TaskReminderOccurrences => Set<TaskReminderOccurrence>();
+    public DbSet<TaskActivity> TaskActivities => Set<TaskActivity>();
     protected override void OnModelCreating(ModelBuilder m) {
         m.Entity<AppUser>().HasIndex(x=>x.Email).IsUnique(); m.Entity<IdempotencyRecord>().HasIndex(x=>new{x.UserId,x.Key}).IsUnique(); m.Entity<LifeItem>().HasIndex(x=>x.UserId); m.Entity<Reminder>().HasIndex(x=>new{x.Delivered,x.DueUtc}); m.Entity<AuditEvent>().HasIndex(x=>new{x.UserId,x.OccurredUtc});
         // Recurring tasks. The unique indexes are the last line of defence against duplicate occurrences and reminders.
@@ -228,6 +252,10 @@ public class LifeDb(DbContextOptions<LifeDb> options) : DbContext(options) {
         m.Entity<TaskReminderOccurrence>().HasOne<TaskOccurrence>().WithMany().HasForeignKey(x => x.OccurrenceId).OnDelete(DeleteBehavior.Cascade);
         m.Entity<TaskReminderOccurrence>().HasIndex(x => new { x.ReminderId, x.OccurrenceId }).IsUnique();
         m.Entity<TaskReminderOccurrence>().HasIndex(x => x.OccurrenceId);
+        // Task activity history: listed newest first per owner (cursor on Id) and per task. Rows reference tasks by id
+        // only, deliberately without a foreign key, so history outlives the deleted task it describes.
+        m.Entity<TaskActivity>().HasIndex(x => new { x.UserId, x.Id });
+        m.Entity<TaskActivity>().HasIndex(x => new { x.UserId, x.TaskType, x.TaskId });
     }
 }
 public class AppUser { public int Id {get;set;} public string Email {get;set;}=""; public string PasswordHash {get;set;}=""; public string Role {get;set;}="Member"; }
